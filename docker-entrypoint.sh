@@ -16,7 +16,8 @@ fi
 
 echo "Login once at start up:"
 
-$cmd
+# 重定向符无法通过变量展开获得 ($cmd 展开后的 > 只会成为普通参数), 必须直接书写
+/bupt-net-login >/proc/1/fd/1 2>/proc/1/fd/2
 
 echo "Initialized with the following cron job:"
 echo "----- BEGIN CRON -----"

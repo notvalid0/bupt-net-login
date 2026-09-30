@@ -2,23 +2,8 @@
 
 # bupt-net-login is a authenticator for BUPT (Beijing University
 # of Posts and Telecommunications) campus network.
-# Copyright (C) 2024 Charlie Chiang
 
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-
-# Just in case PATH is not set.
+#Just in case these not in PATH
 PATH=$PATH:/bin:/usr/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin
 
 NC='\033[0m'
@@ -262,7 +247,7 @@ check_response() {
             exit 1
         fi
         REDIRECTION_TEST_URL="$jump_url"
-        main
+        portal_main
     else
         error "收到来自 $REDIRECTION_TEST_URL 的未知响应: \"$page_body\" 本次认证失败, 以下为 debug 信息"
         curl -4vsS "${REDIRECTION_TEST_URL}"
@@ -270,11 +255,104 @@ check_response() {
     fi
 }
 
-main() {
+write_iwd() {
+    local ssid="${1:-BUPT-mobile}"
+    local iwd_file_path="/var/lib/iwd/${ssid}.8021x"
+    
+    if [[ -f "$iwd_file_path" ]]; then
+        warn "配置文件 $iwd_file_path 已存在。如需重新生成，请先手动删除它 (sudo rm $iwd_file_path)。"
+        return 1
+    fi
+
+    info "正在生成 $iwd_file_path ..."
+    if echo "[Security]
+EAP-Method=PEAP
+EAP-Identity=anonymous
+EAP-PEAP-CACert=disabled
+EAP-PEAP-Phase2-Method=MSCHAPV2
+EAP-PEAP-Phase2-Identity=$BUPT_USERNAME
+EAP-PEAP-Phase2-Password=$BUPT_PASSWORD
+
+[Settings]
+AutoConnect=true" | sudo tee "$iwd_file_path" > /dev/null; then
+        sudo chmod 600 "$iwd_file_path"
+        info "✅ 成功生成配置文件: $iwd_file_path"
+        info "💡 提示: 请运行 'sudo systemctl restart iwd' 重启服务以应用更改。"
+    else
+        fatal "❌ 写入文件失败，请检查是否具有 sudo 权限。"
+    fi
+}
+
+portal_main() {
     local resp
     # -w 在响应体之后附加换行与重定向地址, 下面拆分为 响应体 与 重定向URL
     resp="$(curl $debug_args -4sS -w $'\n%{redirect_url}' "${REDIRECTION_TEST_URL}")"
     check_response "${resp%$'\n'*}" "${resp##*$'\n'}"
+}
+
+mobile_main() {
+    echo "This script will generate a config file at /var/lib/iwd/essid.8021x"
+    
+    while true; do
+        if ! read -p "Go on? [Y/n] " choice; then
+            warn "未读取到输入 (EOF), 已取消"
+            return 0
+        fi
+        case $choice in 
+            [Yy]|"")
+                echo "✅ Proceeding..."
+                write_iwd 
+                break
+                ;;
+                
+            [Nn])
+                echo "❌ Operation cancelled."
+                return 0
+                ;;
+                
+            *)
+                echo "⚠️ Invalid input. Please enter Y, n, or just press Enter."
+                ;;
+        esac
+    done
+}
+
+main(){
+    # cron 等无终端环境没有 stdin, 直接执行 portal 认证, 避免 read 读到 EOF 后死循环
+    if [[ ! -t 0 ]]; then
+        portal_main
+        return
+    fi
+
+    echo "请选择要配置的校园网类型："
+    echo "  1) BUPT-mobile (5GHz, 要求网卡支持)"
+    echo "  2) BUPT-portal (2.4GHz, 要求ipv4支持)"
+
+    while true; do
+        if ! read -p "请选择 [1 或 2]: " choice; then
+            warn "未读取到输入 (EOF), 回退到 BUPT-portal 认证"
+            portal_main
+            return
+        fi
+    
+        case $choice in
+            1)
+                SSID="BUPT-mobile"
+                echo "✅ 已选择: $SSID"
+                mobile_main
+                break
+                ;;
+            2)
+                SSID="BUPT-portal"
+                echo "✅ 已选择: $SSID"
+                portal_main
+                break
+                ;;
+            *)
+                echo "❌ 无效输入，请重新输入 1 或 2"
+                ;;
+        esac
+    done
 }
 
 main
