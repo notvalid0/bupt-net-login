@@ -2,6 +2,7 @@
 
 # bupt-net-login is a authenticator for BUPT (Beijing University
 # of Posts and Telecommunications) campus network.
+# BUPT-portal: IPv4 captive portal. BUPT-mobile: WPA2-Enterprise PEAP.
 
 #Just in case these not in PATH
 PATH=$PATH:/bin:/usr/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin
@@ -35,24 +36,33 @@ fatal() {
 
 ask_cred() {
     # already set username and password in environment variables, skip
-    if [[ -n "$BUPT_USERNAME" && -n "$BUPT_PASSWORD" ]]; then
-        return
-    fi
-
-    # try to read saved username and password from file
-    if [[ -f $HOME/.bupt-net-login ]]; then
-        source $HOME/.bupt-net-login
+    if [[ -z "$BUPT_USERNAME" || -z "$BUPT_PASSWORD" ]]; then
+        # try to read saved username and password from file
+        if [[ -f "$HOME/.bupt-net-login" ]]; then
+            # shellcheck disable=SC1090
+            source "$HOME/.bupt-net-login"
+        fi
     fi
 
     # if still not set, ask user to input
     if [[ -z "$BUPT_USERNAME" || -z "$BUPT_PASSWORD" ]]; then
         warn "你没有设置 BUPT_USERNAME 和 BUPT_PASSWORD 环境变量（例如 \"BUPT_USERNAME=2019000000 BUPT_PASSWORD=123456 $0\"），也没有保存密码。"
-        echo "请手动输入学号和网关密码，你的信息将用于网关认证。"
-        read -p '你的学号 Username: ' BUPT_USERNAME
-        read -s -p '网关密码 Password: ' BUPT_PASSWORD
+        echo "请手动输入学号和网关密码。门户登录和 BUPT-mobile 的 802.1X 使用同一对凭据。"
+        # IFS= 保留首尾空白; -r 保留反斜杠。默认 read 会把它们从密码里丢掉。
+        if ! IFS= read -r -p '你的学号 Username: ' BUPT_USERNAME; then
+            fatal "未读取到学号"
+        fi
+        if ! IFS= read -r -s -p '网关密码 Password: ' BUPT_PASSWORD; then
+            echo
+            fatal "未读取到密码"
+        fi
         echo
 
-        read -p "是否保存用户名密码以方便下次手动登录？注意，你的凭据将被明文存储。(y/N) " -n 1 -r
+        if [[ -z "$BUPT_USERNAME" || -z "$BUPT_PASSWORD" ]]; then
+            fatal "学号或密码为空"
+        fi
+
+        read -r -p "是否保存用户名密码以方便下次手动登录？注意，你的凭据将被明文存储。(y/N) " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             # 用 printf %q 转义, 避免密码含单引号、$、反斜杠等字符破坏凭据文件
@@ -61,6 +71,13 @@ ask_cred() {
             chmod 600 "$HOME/.bupt-net-login"
             info "已保存你的凭据至 $HOME/.bupt-net-login ，如果你想删除凭据，请直接删除该文件。"
         fi
+    fi
+
+    if [[ -z "$BUPT_USERNAME" || -z "$BUPT_PASSWORD" ]]; then
+        fatal "未取得学号或密码"
+    fi
+    if [[ "$BUPT_USERNAME" == *$'\n'* || "$BUPT_USERNAME" == *$'\r'* || "$BUPT_PASSWORD" == *$'\n'* || "$BUPT_PASSWORD" == *$'\r'* ]]; then
+        fatal "学号或密码包含换行符, 无法写入配置"
     fi
 }
 
@@ -220,7 +237,15 @@ login() {
 }
 
 test_login() {
-    curl $debug_args -4s "${PROBE_URL}" | grep -q "Success"
+    local body status
+    # -4: 门户在 IPv4。IPv6 可能不经认证就能打开探测页。
+    body="$(curl $debug_args -4sS "${PROBE_URL}")"
+    status=$?
+    if [[ $status -ne 0 ]]; then
+        error "登录结果检查失败: curl -4 ${PROBE_URL} 退出状态 ${status}"
+        return 1
+    fi
+    printf '%s' "$body" | grep -q "Success"
 }
 
 check_response() {
@@ -251,70 +276,409 @@ check_response() {
     else
         error "收到来自 $REDIRECTION_TEST_URL 的未知响应: \"$page_body\" 本次认证失败, 以下为 debug 信息"
         curl -4vsS "${REDIRECTION_TEST_URL}"
+        error "curl -4 退出状态 $?"
         exit 1
     fi
 }
 
-write_iwd() {
-    local ssid="${1:-BUPT-mobile}"
-    local iwd_file_path="/var/lib/iwd/${ssid}.8021x"
-    
-    if [[ -f "$iwd_file_path" ]]; then
-        warn "配置文件 $iwd_file_path 已存在。如需重新生成，请先手动删除它 (sudo rm $iwd_file_path)。"
-        return 1
-    fi
+# ell (iwd) 与 GLib keyfile (NetworkManager) 的字符串转义相同:
+# 行首空白写成 \s / \t, 反斜杠写成 \\, 换行写成 \n / \r。不要加引号。
+settings_escape() {
+    local s=$1
+    local c out=""
+    local bs='\'
+    local -i i lead=1
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        case "$c" in
+            ' ')
+                if [[ $lead -eq 1 ]]; then
+                    out+="${bs}s"
+                else
+                    out+="$c"
+                fi
+                ;;
+            $'\t')
+                if [[ $lead -eq 1 ]]; then
+                    out+="${bs}t"
+                else
+                    out+="$c"
+                fi
+                ;;
+            $'\n')
+                out+="${bs}n"
+                lead=0
+                ;;
+            $'\r')
+                out+="${bs}r"
+                lead=0
+                ;;
+            "$bs")
+                out+="${bs}${bs}"
+                lead=0
+                ;;
+            *)
+                out+="$c"
+                lead=0
+                ;;
+        esac
+    done
+    printf '%s' "$out"
+}
 
-    info "正在生成 $iwd_file_path ..."
-    if echo "[Security]
-EAP-Method=PEAP
-EAP-Identity=anonymous
-EAP-PEAP-CACert=disabled
-EAP-PEAP-Phase2-Method=MSCHAPV2
-EAP-PEAP-Phase2-Identity=$BUPT_USERNAME
-EAP-PEAP-Phase2-Password=$BUPT_PASSWORD
-
-[Settings]
-AutoConnect=true" | sudo tee "$iwd_file_path" > /dev/null; then
-        sudo chmod 600 "$iwd_file_path"
-        info "✅ 成功生成配置文件: $iwd_file_path"
-        info "💡 提示: 请运行 'sudo systemctl restart iwd' 重启服务以应用更改。"
+as_root() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
     else
-        fatal "❌ 写入文件失败，请检查是否具有 sudo 权限。"
+        sudo "$@"
     fi
 }
 
+need_sudo() {
+    if [[ $EUID -eq 0 ]]; then
+        return 0
+    fi
+    if ! command -v sudo >/dev/null 2>&1; then
+        fatal "写入系统网络配置需要 root。当前不是 root, 且没有 sudo。"
+    fi
+    # 先缓存凭据, 后面的 sudo tee 才能从管道读取配置而不是密码
+    if ! sudo -v; then
+        fatal "sudo 验证失败, 无法写入系统网络配置。"
+    fi
+}
+
+service_active() {
+    local name=$1
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$name"
+        return
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -x "$name" >/dev/null 2>&1
+        return
+    fi
+    return 1
+}
+
+have_iwd() {
+    command -v iwctl >/dev/null 2>&1 || command -v iwd >/dev/null 2>&1 \
+        || [[ -f /usr/lib/systemd/system/iwd.service || -f /lib/systemd/system/iwd.service ]]
+}
+
+have_nm() {
+    command -v nmcli >/dev/null 2>&1 \
+        || [[ -f /usr/lib/systemd/system/NetworkManager.service || -f /lib/systemd/system/NetworkManager.service ]]
+}
+
+nm_uses_iwd_backend() {
+    local bin=""
+    if command -v NetworkManager >/dev/null 2>&1; then
+        bin=$(command -v NetworkManager)
+    elif [[ -x /usr/sbin/NetworkManager ]]; then
+        bin=/usr/sbin/NetworkManager
+    fi
+    [[ -n $bin ]] || return 1
+    "$bin" --print-config 2>/dev/null \
+        | grep -Eiq '^[[:space:]]*wifi\.backend[[:space:]]*=[[:space:]]*iwd[[:space:]]*$'
+}
+
+# 只向 stdout 打印一个标记: iwd, nm, nm-iwd, iwd-inactive, nm-inactive, choose, conflict, none
+detect_wifi_backend() {
+    local nm_on=0 iwd_on=0
+    if service_active NetworkManager; then
+        nm_on=1
+    fi
+    if service_active iwd; then
+        iwd_on=1
+    fi
+
+    if [[ $nm_on -eq 1 && $iwd_on -eq 1 ]]; then
+        if nm_uses_iwd_backend; then
+            echo nm-iwd
+        else
+            echo conflict
+        fi
+        return
+    fi
+    if [[ $iwd_on -eq 1 ]]; then
+        echo iwd
+        return
+    fi
+    if [[ $nm_on -eq 1 ]]; then
+        echo nm
+        return
+    fi
+
+    local has_iwd=0 has_nm=0
+    if have_iwd; then
+        has_iwd=1
+    fi
+    if have_nm; then
+        has_nm=1
+    fi
+    if [[ $has_iwd -eq 1 && $has_nm -eq 1 ]]; then
+        echo choose
+        return
+    fi
+    if [[ $has_iwd -eq 1 ]]; then
+        echo iwd-inactive
+        return
+    fi
+    if [[ $has_nm -eq 1 ]]; then
+        echo nm-inactive
+        return
+    fi
+    echo none
+}
+
+choose_mobile_backend() {
+    echo "检测到 NetworkManager 和 iwd 都已安装, 但都没有在运行。" >&2
+    echo "  1) 为 iwd 写入配置" >&2
+    echo "  2) 为 NetworkManager 写入配置" >&2
+    local choice
+    while true; do
+        if ! read -r -p "请选择 [1 或 2]: " choice; then
+            warn "未读取到输入 (EOF), 已取消" >&2
+            return 1
+        fi
+        case $choice in
+            1) echo iwd-inactive; return 0 ;;
+            2) echo nm-inactive; return 0 ;;
+            *) echo "请重新输入 1 或 2" >&2 ;;
+        esac
+    done
+}
+
+new_uuid() {
+    if [[ -r /proc/sys/kernel/random/uuid ]]; then
+        cat /proc/sys/kernel/random/uuid
+        return
+    fi
+    if command -v uuidgen >/dev/null 2>&1; then
+        uuidgen
+        return
+    fi
+    printf '%04x%04x-%04x-%04x-%04x-%04x%04x%04x\n' \
+        $RANDOM $RANDOM $RANDOM \
+        $((RANDOM & 0x0fff | 0x4000)) \
+        $((RANDOM & 0x3fff | 0x8000)) \
+        $RANDOM $RANDOM $RANDOM
+}
+
+write_iwd() {
+    local ssid=${1:-BUPT-mobile}
+    local iwd_file_path="/var/lib/iwd/${ssid}.8021x"
+    local iwd_user iwd_pass
+
+    need_sudo
+    if ! as_root mkdir -p /var/lib/iwd; then
+        fatal "无法创建 /var/lib/iwd。请先安装 iwd, 并确认当前用户可以 sudo。"
+    fi
+    if as_root test -f "$iwd_file_path"; then
+        warn "配置文件 $iwd_file_path 已存在。查看: sudo cat $iwd_file_path"
+        warn "如需重新生成, 请先删除: sudo rm $iwd_file_path"
+        return 1
+    fi
+
+    iwd_user=$(settings_escape "$BUPT_USERNAME")
+    iwd_pass=$(settings_escape "$BUPT_PASSWORD")
+
+    info "正在生成 $iwd_file_path ..."
+    # 省略 EAP-PEAP-CACert: iwd 文档规定省略即不校验服务器证书
+    if ! printf '%s\n' \
+        "[Security]" \
+        "EAP-Method=PEAP" \
+        "EAP-Identity=anonymous" \
+        "EAP-PEAP-Phase2-Method=MSCHAPV2" \
+        "EAP-PEAP-Phase2-Identity=${iwd_user}" \
+        "EAP-PEAP-Phase2-Password=${iwd_pass}" \
+        "" \
+        "[Settings]" \
+        "AutoConnect=true" | as_root tee "$iwd_file_path" >/dev/null; then
+        fatal "写入 $iwd_file_path 失败。请确认 iwd 已安装, 且当前用户可以 sudo。"
+    fi
+    if ! as_root chmod 600 "$iwd_file_path"; then
+        error "已写入 $iwd_file_path, 但无法设为 600。请执行: sudo chmod 600 $iwd_file_path"
+        return 1
+    fi
+    info "已生成配置文件: $iwd_file_path"
+    info "该目录只有 root 能列出。查看: sudo cat $iwd_file_path"
+    info "未设置 EAP-PEAP-CACert, iwd 不会校验认证服务器证书。"
+    info "应用配置: sudo systemctl restart iwd"
+    info "然后连接: iwctl station <接口名> connect ${ssid}    (接口名见 iwctl device list)"
+}
+
+write_nm() {
+    local ssid=${1:-BUPT-mobile}
+    local dir="/etc/NetworkManager/system-connections"
+    local path="${dir}/${ssid}.nmconnection"
+    local nm_user nm_pass nm_ssid uuid
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        fatal "未找到 nmcli。请先安装 NetworkManager。"
+    fi
+    if nmcli -t -f NAME connection show 2>/dev/null | grep -Fxq "$ssid"; then
+        warn "名为 ${ssid} 的 NetworkManager 连接已存在。如需重新生成, 请先执行: sudo nmcli connection delete \"${ssid}\""
+        return 1
+    fi
+
+    need_sudo
+    if ! as_root test -d "$dir"; then
+        fatal "未找到 ${dir}。请确认 NetworkManager 已安装。"
+    fi
+    if as_root test -e "$path"; then
+        warn "连接配置 $path 已存在。查看: sudo cat $path"
+        warn "如需重新生成, 请先删除: sudo rm $path 或 sudo nmcli connection delete \"${ssid}\""
+        return 1
+    fi
+
+    nm_user=$(settings_escape "$BUPT_USERNAME")
+    nm_pass=$(settings_escape "$BUPT_PASSWORD")
+    nm_ssid=$(settings_escape "$ssid")
+    uuid=$(new_uuid)
+
+    info "正在生成 $path ..."
+    # 不写 ca-cert: NetworkManager 允许省略, 此时不校验认证服务器证书
+    if ! printf '%s\n' \
+        "[connection]" \
+        "id=${ssid}" \
+        "uuid=${uuid}" \
+        "type=wifi" \
+        "autoconnect=true" \
+        "" \
+        "[wifi]" \
+        "mode=infrastructure" \
+        "ssid=${nm_ssid}" \
+        "" \
+        "[wifi-security]" \
+        "key-mgmt=wpa-eap" \
+        "" \
+        "[802-1x]" \
+        "anonymous-identity=anonymous" \
+        "eap=peap;" \
+        "identity=${nm_user}" \
+        "password=${nm_pass}" \
+        "password-flags=0" \
+        "phase2-auth=mschapv2" \
+        "system-ca-certs=false" \
+        "" \
+        "[ipv4]" \
+        "method=auto" \
+        "" \
+        "[ipv6]" \
+        "method=auto" | as_root tee "$path" >/dev/null; then
+        fatal "写入 $path 失败。请确认当前用户可以 sudo。"
+    fi
+    if ! as_root chmod 600 "$path"; then
+        error "已写入 $path, 但无法设为 600。NetworkManager 会忽略其他用户可读的连接文件。请执行: sudo chmod 600 $path"
+        return 1
+    fi
+    as_root chown root:root "$path" 2>/dev/null || true
+
+    if as_root nmcli connection load "$path"; then
+        info "已载入 NetworkManager 连接: ${ssid}"
+    else
+        warn "已写入 $path, 但 nmcli connection load 失败。请确认 NetworkManager 正在运行, 然后执行: sudo nmcli connection load $path"
+    fi
+    info "该文件只有 root 能读。查看: sudo cat $path"
+    info "未设置 802-1x.ca-cert, 认证服务器证书不会被校验。"
+    info "连接: sudo nmcli connection up \"${ssid}\""
+}
+
+require_ipv4() {
+    if ! command -v ip >/dev/null 2>&1; then
+        warn "未找到 ip 命令, 跳过 IPv4 路由检查, 继续使用 curl -4 探测。"
+        return 0
+    fi
+    if ip -4 route show default 2>/dev/null | grep -q .; then
+        return 0
+    fi
+    error "当前没有 IPv4 默认路由。BUPT-portal 的网关是 10.3.8.216 (无线) 或 10.3.8.211 (有线), 探测使用 curl -4。"
+    echo "请先让校园网接口通过 DHCP 拿到 10. 开头的地址, 再运行本脚本。查看: ip -4 addr; ip -4 route"
+    echo "  - systemd-networkd: 在该接口的 .network 里写上 DHCP=yes, 然后 networkctl reconfigure <接口>"
+    echo "  - NetworkManager: 连接到开放网络 BUPT-portal, IPv4 方法用自动 (DHCP)"
+    echo "  - iwd 只负责连上 BUPT-portal, 地址要由 networkd 或 NetworkManager 分配"
+    exit 1
+}
+
 portal_main() {
-    local resp
+    local resp curl_status
+    require_ipv4
     # -w 在响应体之后附加换行与重定向地址, 下面拆分为 响应体 与 重定向URL
+    # -4 保留: 只探测门户所在的 IPv4。去掉后, 已放行的 IPv6 会让脚本误判为已登录。
     resp="$(curl $debug_args -4sS -w $'\n%{redirect_url}' "${REDIRECTION_TEST_URL}")"
+    curl_status=$?
+    if [[ $curl_status -ne 0 ]]; then
+        error "IPv4 探测失败: curl -4 ${REDIRECTION_TEST_URL} 退出状态 ${curl_status}。请保留 -4, 门户认证走 IPv4。"
+        exit 1
+    fi
     check_response "${resp%$'\n'*}" "${resp##*$'\n'}"
 }
 
 mobile_main() {
-    echo "This script will generate a config file at /var/lib/iwd/essid.8021x"
-    
+    local ssid=${1:-BUPT-mobile}
+    local backend choice
+
+    backend=$(detect_wifi_backend)
+    if [[ $backend == choose ]]; then
+        if ! backend=$(choose_mobile_backend); then
+            return 0
+        fi
+    fi
+
+    case $backend in
+        conflict)
+            fatal "NetworkManager 和 iwd 同时在运行, 且 NetworkManager 没有把 wifi.backend 设为 iwd。两者会抢同一块网卡。请只留一个: sudo systemctl stop NetworkManager 后使用 iwd, 或 sudo systemctl stop iwd 后使用 NetworkManager。"
+            ;;
+        none)
+            fatal "没有检测到 NetworkManager 或 iwd。BUPT-mobile 是 802.1X (PEAP), 需要其中之一。"
+            ;;
+        iwd|iwd-inactive)
+            echo "将为 iwd 写入 /var/lib/iwd/${ssid}.8021x"
+            echo "这个目录只有 root 能列出, 写完后用 sudo cat 查看。"
+            if [[ $backend == iwd-inactive ]]; then
+                warn "iwd 现在没有运行。配置会先写好, 之后执行 sudo systemctl start iwd。"
+            fi
+            ;;
+        nm|nm-iwd|nm-inactive)
+            echo "将为 NetworkManager 写入 /etc/NetworkManager/system-connections/${ssid}.nmconnection"
+            if [[ $backend == nm-iwd ]]; then
+                info "NetworkManager 的 Wi-Fi 后端是 iwd, 连接由 NetworkManager 保存, 不写 /var/lib/iwd。"
+            fi
+            if [[ $backend == nm-inactive ]]; then
+                warn "NetworkManager 现在没有运行。配置会先写好, 之后执行 sudo systemctl start NetworkManager。"
+            fi
+            ;;
+        *)
+            fatal "无法识别无线后端: ${backend}"
+            ;;
+    esac
+
     while true; do
-        if ! read -p "Go on? [Y/n] " choice; then
+        if ! read -r -p "继续? [Y/n] " choice; then
             warn "未读取到输入 (EOF), 已取消"
             return 0
         fi
-        case $choice in 
+        case $choice in
             [Yy]|"")
-                echo "✅ Proceeding..."
-                write_iwd 
                 break
                 ;;
-                
             [Nn])
-                echo "❌ Operation cancelled."
+                echo "已取消。"
                 return 0
                 ;;
-                
             *)
-                echo "⚠️ Invalid input. Please enter Y, n, or just press Enter."
+                echo "请输入 Y、n, 或直接回车。"
                 ;;
         esac
     done
+
+    ask_cred
+
+    case $backend in
+        iwd|iwd-inactive) write_iwd "$ssid" ;;
+        nm|nm-iwd|nm-inactive) write_nm "$ssid" ;;
+    esac
 }
 
 main(){
@@ -325,31 +689,31 @@ main(){
     fi
 
     echo "请选择要配置的校园网类型："
-    echo "  1) BUPT-mobile (5GHz, 要求网卡支持)"
-    echo "  2) BUPT-portal (2.4GHz, 要求ipv4支持)"
+    echo "  1) BUPT-mobile  802.1X (PEAP), 由 iwd 或 NetworkManager 在连上时认证"
+    echo "  2) BUPT-portal  开放网络上的网页门户, 需要 IPv4 (网关 10.3.8.216)"
 
     while true; do
-        if ! read -p "请选择 [1 或 2]: " choice; then
+        if ! read -r -p "请选择 [1 或 2]: " choice; then
             warn "未读取到输入 (EOF), 回退到 BUPT-portal 认证"
             portal_main
             return
         fi
-    
+
         case $choice in
             1)
                 SSID="BUPT-mobile"
-                echo "✅ 已选择: $SSID"
-                mobile_main
+                echo "已选择: ${SSID}"
+                mobile_main "$SSID"
                 break
                 ;;
             2)
                 SSID="BUPT-portal"
-                echo "✅ 已选择: $SSID"
+                echo "已选择: ${SSID}"
                 portal_main
                 break
                 ;;
             *)
-                echo "❌ 无效输入，请重新输入 1 或 2"
+                echo "无效输入，请重新输入 1 或 2"
                 ;;
         esac
     done
